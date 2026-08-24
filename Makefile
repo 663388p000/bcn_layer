@@ -34,7 +34,8 @@ SPIRV_SHADERS := src/s3tc.spv \
                  src/bc6_iv.spv \
                  src/bc7.spv \
                  src/bc7_iv.spv \
-                 src/astc_encode.spv 
+                 src/astc_encode.spv \
+                 src/astc_encode_hdr.spv 
 
 SPIRV_HEADERS := src/s3tc_spv.h \
 				 src/s3tc_iv_spv.h \

@@ -4,7 +4,7 @@ LDFLAGS := -shared
 PREFIX := /usr
 JSON := libbcn_layer.json
 JSON_INSTALL := $(PREFIX)/share/vulkan/implicit_layer.d
-INSTALL := $(PREFIX)/lib/x86_64-linux-gnu
+INSTALL := $(PREFIX)/lib/aarch64-linux-gnu
 
 SOURCES := src/bcn_layer.cpp \
 		   src/image.cpp \

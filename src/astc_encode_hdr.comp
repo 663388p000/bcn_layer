@@ -1,1 +1,267 @@
+#version 450
+/*
+ * BC6H -> ASTC HDR re-encoder.
+ *
+ * Companion to astc_encode.comp (which handles BC1-5/BC7, LDR, CEM=12).
+ * This shader handles BC6H specifically, because BC6H is HDR: its decoded
+ * values are unbounded floating point, so the LDR CEM=12 (0..255 direct)
+ * path used for the other formats cannot represent it - it would just
+ * clip everything to a fixed 0..1 range.
+ *
+ * Input: the buffer written by bc6.comp's buffer-output path. That shader
+ * already stores each channel as a RAW IEEE754 half-float BIT PATTERN
+ * (see bc6.comp: "packed_rg = rgba_result.r & 0xFFFFu | ...", where
+ * rgba_result is produced by the BC6H "squeeze range" step and is, by
+ * construction, already in fp16 bit-pattern form - alpha is literally
+ * hardcoded to 0x3C00, the fp16 bit pattern for 1.0). That is extremely
+ * convenient here, because ASTC's own HDR endpoint math
+ * (spec C.2.19: "this final value Cf is interpreted as an IEEE FP16
+ * value") is *also* raw fp16-bit based, so no float<->half conversions
+ * are needed for the exponent/mantissa split below.
+ *
+ * ASTC block configuration used (single always-valid, non-partitioned
+ * "direct" HDR encoding):
+ *
+ *   - Block footprint : 4x4, weight grid 4x4 (no infill), weight range 0..3
+ *                        (identical block-mode field to the LDR encoder:
+ *                        0x050 - see astc_encode.comp for the full
+ *                        derivation of that field from Table C.2.8)
+ *   - Partitions        : 1
+ *   - CEM                : 11 (HDR RGB, direct) - Table C.2.10
+ *   - Endpoint layout (spec C.2.15, HDR Endpoint Mode 11):
+ *       v0 = R0[11:4]                     (8 bits, direct)
+ *       v1 = R1[11:4]                     (8 bits, direct)
+ *       v2 = G0[11:4]                     (8 bits, direct)
+ *       v3 = G1[11:4]                     (8 bits, direct)
+ *       v4 = 1 | B0[11:5]                 (top bit forced 1, 7 usable bits)
+ *       v5 = 1 | B1[11:5]                 (top bit forced 1, 7 usable bits)
+ *     which the decoder recognises as the "majcomp==3" direct bypass:
+ *         majcomp = (v4>>7) | ((v5>>7)<<1) == 3  (guaranteed by v4/v5 top bit)
+ *         e0 = (v0<<4, v2<<4, (v4&0x7F)<<5, 0x780)   // 0x780 = fp16 1.0 -> alpha
+ *         e1 = (v1<<4, v3<<4, (v5&0x7F)<<5, 0x780)
+ *     Alpha is always opaque - correct, since BC6H itself has no alpha
+ *     channel.
+ *   - Endpoint quantization range: 6 raw values (v0..v5), 8 bits each =
+ *     48 bits, which (same reasoning as the LDR shader) is what any
+ *     conformant decoder resolves to (largest available range, 256
+ *     levels / pure 8-bit) given the 79 remaining bits after config+weights.
+ *
+ * IMPORTANT LIMITATION: the CEM=11 "direct" bypass path used here can only
+ * represent NON-NEGATIVE colors (its endpoint math has no sign bit - see
+ * spec C.2.19, Cf is built with an implicit sign of 0). This matches
+ * VK_FORMAT_BC6H_UFLOAT_BLOCK content directly. For
+ * VK_FORMAT_BC6H_SFLOAT_BLOCK source data that actually contains negative
+ * values, those values are clamped to 0 here (a real precision loss for
+ * that specific case) - representing true negative HDR endpoints requires
+ * the much more involved mode-dependent HDR Mode 11 bit layout (Table
+ * C.2.21/C.2.23), which is a separate, significantly larger undertaking
+ * (per-mode bit budgets, signed delta components, etc.) and is not
+ * implemented here.
+ *
+ * Also, because only 8 (R/G) or 7 (B) of the 12 endpoint bits are
+ * controllable in this direct bypass mode, this trades some HDR precision
+ * for guaranteed-valid, simple bit packing - comparable in spirit to how
+ * astc_encode.comp trades partition search for simplicity on the LDR side.
+ *
+ * NOT executed/validated against a real ASTC HDR decoder in this
+ * environment - validate with astcenc (HDR mode) or a real ASTC HDR
+ * capable GPU + validation layers before shipping.
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) writeonly buffer uAstcOutputBlock {
+	uint data[];
+} uAstcOutput;
+
+// Buffer written by bc6.comp's buffer-output path: 2x uint per texel
+// (packed_rg, packed_ba), each uint holding two raw fp16 bit patterns.
+layout(set = 0, binding = 1) readonly buffer uDecodedInputBlock {
+	uint data[];
+} uDecoded;
+
+layout(push_constant) uniform Registers
+{
+	int format;           // unused here
+	int width;
+	int height;
+	int offset;            // unused
+	int bufferRowLength;    // unused - decoded buffer assumed tightly packed
+	int offsetX;              // unused
+	int offsetY;               // unused
+} registers;
+
+void insert_bits(inout uvec4 payload, int offset, int bits, uint value)
+{
+	if (bits <= 0)
+		return;
+
+	uint vmask = (bits >= 32) ? 0xFFFFFFFFu : ((1u << bits) - 1u);
+	value &= vmask;
+
+	int word = offset >> 5;
+	int bit = offset & 31;
+	int last_offset = offset + bits - 1;
+
+	if ((last_offset >> 5) == word)
+	{
+		uint mask = vmask << bit;
+		payload[word] = (payload[word] & ~mask) | (value << bit);
+	}
+	else
+	{
+		int first_bits = 32 - bit;
+		uint mask0 = 0xFFFFFFFFu << bit;
+		payload[word] = (payload[word] & ~mask0) | ((value << bit) & mask0);
+
+		uint value2 = value >> first_bits;
+		int bits2 = bits - first_bits;
+		uint mask1 = (bits2 >= 32) ? 0xFFFFFFFFu : ((1u << bits2) - 1u);
+		payload[word + 1] = (payload[word + 1] & ~mask1) | (value2 & mask1);
+	}
+}
+
+const uint BLOCK_MODE = 0x050u; // same weight-grid config as the LDR shader
+const uint CEM_HDR_RGB_DIRECT = 11u;
+
+// Invert the ASTC HDR piecewise Mt(M) function from spec C.2.19:
+//   if      (M <  512) Mt = 3*M
+//   else if (M >= 1536) Mt = 5*M - 2048
+//   else                Mt = 4*M - 512
+// Given a target Mt (built so that a conformant decoder's Mt>>3 reproduces
+// our desired 10-bit fp16 mantissa exactly), recover an M (0..2047) that
+// produces it.
+uint invert_Mt(uint Mt)
+{
+	uint M;
+	if (Mt < 1536u)
+		M = (Mt + 1u) / 3u;
+	else if (Mt < 5632u)
+		M = (Mt + 512u + 2u) / 4u;
+	else
+		M = (Mt + 2048u + 2u) / 5u;
+	return min(M, 2047u);
+}
+
+// Produce the 8-bit "direct" stored value for an R or G endpoint channel
+// from a raw (non-negative) fp16 bit pattern.
+uint half_to_direct8(uint halfBits)
+{
+	uint e = (halfBits >> 10) & 0x1Fu; // fp16 exponent (5 bits)
+	uint m = halfBits & 0x3FFu;         // fp16 mantissa (10 bits)
+	uint Mt = m * 8u;
+	uint M = invert_Mt(Mt);
+	uint extra3 = min(M >> 8, 7u);
+	return (e << 3) | extra3; // 8 bits, fits exactly (31<<3 | 7 = 255)
+}
+
+// Produce the 7-usable-bit (top bit will be forced to 1 by the caller)
+// stored value for a B endpoint channel from a raw fp16 bit pattern.
+uint half_to_direct7(uint halfBits)
+{
+	uint e = (halfBits >> 10) & 0x1Fu;
+	uint m = halfBits & 0x3FFu;
+	uint Mt = m * 8u;
+	uint M = invert_Mt(Mt);
+	uint extra2 = min(M >> 9, 3u);
+	return (e << 2) | extra2; // 7 bits (31<<2 | 3 = 127)
+}
+
+void main()
+{
+	int width = registers.width;
+	int height = registers.height;
+
+	ivec2 blockCoord = ivec2(gl_GlobalInvocationID.xy);
+	int blocksPerRow = (width + 3) / 4;
+	int blocksPerCol = (height + 3) / 4;
+
+	if (blockCoord.x >= blocksPerRow || blockCoord.y >= blocksPerCol)
+		return;
+
+	// --- Gather the 16 source texels as linear float RGB (decoded from
+	//     the raw fp16 bit patterns), edge-clamped for partial blocks. ---
+	vec3 texel[16];
+	for (int ty = 0; ty < 4; ty++)
+	{
+		for (int tx = 0; tx < 4; tx++)
+		{
+			ivec2 px = min(blockCoord * 4 + ivec2(tx, ty), ivec2(width - 1, height - 1));
+			int idx = px.y * width + px.x;
+			uint packed_rg = uDecoded.data[2 * idx + 0];
+			uint packed_ba = uDecoded.data[2 * idx + 1];
+
+			vec2 rg = unpackHalf2x16(packed_rg);
+			vec2 ba = unpackHalf2x16(packed_ba);
+
+			// Clamp negative values to 0: the CEM=11 direct bypass used
+			// here has no sign bit (see limitation note above).
+			texel[ty * 4 + tx] = max(vec3(rg.x, rg.y, ba.x), vec3(0.0));
+		}
+	}
+
+	// --- Bounding-box endpoints in float space ---
+	vec3 colMin = texel[0];
+	vec3 colMax = texel[0];
+	for (int i = 1; i < 16; i++)
+	{
+		colMin = min(colMin, texel[i]);
+		colMax = max(colMax, texel[i]);
+	}
+
+	// Convert endpoint colors back to raw fp16 bit patterns.
+	uvec2 minRG = uvec2(packHalf2x16(vec2(colMin.r, colMin.g)) & 0xFFFFu,
+	                    (packHalf2x16(vec2(colMin.r, colMin.g)) >> 16) & 0xFFFFu);
+	uvec2 maxRG = uvec2(packHalf2x16(vec2(colMax.r, colMax.g)) & 0xFFFFu,
+	                    (packHalf2x16(vec2(colMax.r, colMax.g)) >> 16) & 0xFFFFu);
+	uint minB = packHalf2x16(vec2(colMin.b, 0.0)) & 0xFFFFu;
+	uint maxB = packHalf2x16(vec2(colMax.b, 0.0)) & 0xFFFFu;
+
+	uint v0 = half_to_direct8(minRG.x); // R0
+	uint v1 = half_to_direct8(maxRG.x); // R1
+	uint v2 = half_to_direct8(minRG.y); // G0
+	uint v3 = half_to_direct8(maxRG.y); // G1
+	uint v4 = 0x80u | half_to_direct7(minB); // B0 (top bit forces majcomp)
+	uint v5 = 0x80u | half_to_direct7(maxB); // B1
+
+	// --- Per-texel weights: project onto the colMin->colMax line ---
+	vec3 dir = colMax - colMin;
+	float denom = dot(dir, dir);
+
+	uint stream_value = 0u;
+	for (int i = 0; i < 16; i++)
+	{
+		float t = 0.0;
+		if (denom > 0.0)
+		{
+			t = dot(texel[i] - colMin, dir) / denom;
+			t = clamp(t, 0.0, 1.0);
+		}
+		uint q = uint(clamp(round(t * 3.0), 0.0, 3.0));
+		stream_value |= (q & 3u) << (2 * i);
+	}
+
+	// --- Assemble the 128-bit block ---
+	uvec4 payload = uvec4(0u);
+
+	insert_bits(payload, 0, 11, BLOCK_MODE);
+	insert_bits(payload, 11, 2, 0u);
+	insert_bits(payload, 13, 4, CEM_HDR_RGB_DIRECT);
+
+	insert_bits(payload, 17, 8, v0);
+	insert_bits(payload, 25, 8, v1);
+	insert_bits(payload, 33, 8, v2);
+	insert_bits(payload, 41, 8, v3);
+	insert_bits(payload, 49, 8, v4);
+	insert_bits(payload, 57, 8, v5);
+
+	payload.w = bitfieldReverse(stream_value);
+
+	int blockIndex = blockCoord.y * blocksPerRow + blockCoord.x;
+	int outOffset = blockIndex * 4;
+	uAstcOutput.data[outOffset + 0] = payload.x;
+	uAstcOutput.data[outOffset + 1] = payload.y;
+	uAstcOutput.data[outOffset + 2] = payload.z;
+	uAstcOutput.data[outOffset + 3] = payload.w;
+}
 
